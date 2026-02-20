@@ -213,6 +213,105 @@ app.get('/api/cron/generate-verses', async (req, res) => {
     }
 });
 
+// Endpoint para guardar tokens FCM
+app.post('/api/register-token', async (req, res) => {
+    const { token, lang, frequency } = req.body;
+    if (!token || !lang || frequency === undefined) return res.status(400).json({ error: "Missing data" });
+
+    try {
+        await db.collection('fcm_tokens').doc(token).set({
+            lang,
+            frequency,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Endpoint para lanzar notificaciones push a todos (Ej. llamándolo con CronJob a las 10:00, 14:00 y 18:00)
+// Ej: /api/cron/push-slot?slot=morning
+app.get('/api/cron/push-slot', async (req, res) => {
+    const { slot } = req.query; // 'morning', 'afternoon', 'evening'
+    if (!slot) return res.status(400).json({ error: "Missing slot" });
+
+    const today = new Date().toISOString().split('T')[0];
+
+    try {
+        const tokensSnapshot = await db.collection('fcm_tokens').get();
+        if (tokensSnapshot.empty) return res.json({ message: "No tokens registered" });
+
+        // Group tokens by language
+        const tokensByLang = { es: [], en: [], pt: [] };
+
+        tokensSnapshot.forEach(doc => {
+            const data = doc.data();
+            // Si la frecuencia es 1 (solo mañana) y el slot actual NO es morning, lo saltamos para este usuario
+            if (data.frequency === 1 && slot !== 'morning') return;
+
+            if (tokensByLang[data.lang]) tokensByLang[data.lang].push(doc.id);
+        });
+
+        const results = {};
+
+        for (const lang of Object.keys(tokensByLang)) {
+            const tokens = tokensByLang[lang];
+            if (tokens.length === 0) continue;
+
+            const verseRef = db.collection('daily_verses').doc(`${today}_${slot}_${lang}`);
+            let verseDoc = await verseRef.get();
+
+            // Si por alguna razón el versículo no estaba pre-generado, lo generamos en el momento
+            if (!verseDoc.exists) {
+                console.log(`Versículo faltante para ${today} ${slot} ${lang}. Generando para Push...`);
+                const newVerse = await getVerseFromGroq(slot, lang, today);
+                await verseRef.set({ ...newVerse, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+                verseDoc = await verseRef.get();
+            }
+
+            const verseData = verseDoc.data();
+            const titles = {
+                es: { morning: "Palabra Viva: Mañana 🌅", afternoon: "Palabra Viva: Tarde ☀️", evening: "Palabra Viva: Noche 🌙" },
+                en: { morning: "Living Word: Morning 🌅", afternoon: "Living Word: Afternoon ☀️", evening: "Living Word: Evening 🌙" },
+                pt: { morning: "Palavra Viva: Manhã 🌅", afternoon: "Palavra Viva: Tarde ☀️", evening: "Palavra Viva: Noite 🌙" }
+            };
+
+            const title = titles[lang]?.[slot] || "Palabra Viva";
+            const body = `${verseData.reference} - "${verseData.text}"`;
+
+            // Enviar en lotes (Firebase requiere arreglos de hasta 500 tokens)
+            const BATC_SIZE = 500;
+            let successCount = 0;
+            let failureCount = 0;
+
+            for (let i = 0; i < tokens.length; i += BATC_SIZE) {
+                const batchTokens = tokens.slice(i, i + BATC_SIZE);
+                const message = { notification: { title, body }, tokens: batchTokens };
+
+                const response = await admin.messaging().sendEachForMulticast(message);
+                successCount += response.successCount;
+                failureCount += response.failureCount;
+
+                // Borrar tokens inválidos
+                if (response.failureCount > 0) {
+                    response.responses.forEach((resp, idx) => {
+                        if (!resp.success && resp.error && (resp.error.code === 'messaging/registration-token-not-registered' || resp.error.code === 'messaging/invalid-registration-token')) {
+                            db.collection('fcm_tokens').doc(batchTokens[idx]).delete();
+                        }
+                    });
+                }
+            }
+            results[lang] = { successCount, failureCount };
+        }
+
+        res.json({ success: true, slot, results });
+    } catch (e) {
+        console.error("Push Notification Error:", e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
