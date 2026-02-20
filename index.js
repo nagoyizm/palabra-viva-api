@@ -128,6 +128,7 @@ async function getVerseFromGroq(slotId, lang, todayString) {
 }
 
 app.get('/api/daily-verse', async (req, res) => {
+    // ... código existente sin modificar ...
     const { lang, slot } = req.query; // lang: es/en/pt, slot: morning/afternoon/evening
 
     if (!lang || !slot) return res.status(400).json({ error: "Missing lang or slot" });
@@ -153,12 +154,61 @@ app.get('/api/daily-verse', async (req, res) => {
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // Opcional: Limpiar registros viejos de más de 7 días usando un script externo o Cloud Function.
-        // No lo hacemos aquí para no ralentizar la respuesta HTTP.
-
         return res.json(newVerse);
     } catch (error) {
         console.error("Error generating verse:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Endpoint para pre-generar los versículos (Llamado idealmente por un Cron Job en la madrugada)
+app.get('/api/cron/generate-verses', async (req, res) => {
+    // Definimos qué día queremos generar. 
+    // Usamos el día actual del servidor (UTC)
+    const targetDate = new Date().toISOString().split('T')[0];
+
+    // Si quisieras generar siempre los de "mañana", harías: 
+    // const dateObj = new Date(); dateObj.setDate(dateObj.getDate() + 1);
+    // const targetDate = dateObj.toISOString().split('T')[0];
+
+    const slots = ['morning', 'afternoon', 'evening'];
+    const langs = ['es', 'en', 'pt'];
+
+    let stats = {
+        generated: 0,
+        skipped: 0,
+        errors: []
+    };
+
+    try {
+        for (const slot of slots) {
+            for (const lang of langs) {
+                const docId = `${targetDate}_${slot}_${lang}`;
+                const verseRef = db.collection('daily_verses').doc(docId);
+                const doc = await verseRef.get();
+
+                if (doc.exists) {
+                    stats.skipped++;
+                    console.log(`[Cron] Ya existe: ${docId}`);
+                } else {
+                    console.log(`[Cron] Generando: ${docId}...`);
+                    try {
+                        const newVerse = await getVerseFromGroq(slot, lang, targetDate);
+                        await verseRef.set({
+                            ...newVerse,
+                            createdAt: admin.firestore.FieldValue.serverTimestamp()
+                        });
+                        stats.generated++;
+                    } catch (generationError) {
+                        console.error(`[Cron] Error generando ${docId}:`, generationError);
+                        stats.errors.push(docId);
+                    }
+                }
+            }
+        }
+        res.json({ message: "Cron execution finished", targetDate, stats });
+    } catch (error) {
+        console.error("Error in cron route:", error);
         res.status(500).json({ error: error.message });
     }
 });
