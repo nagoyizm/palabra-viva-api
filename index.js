@@ -215,13 +215,14 @@ app.get('/api/cron/generate-verses', async (req, res) => {
 
 // Endpoint para guardar tokens FCM
 app.post('/api/register-token', async (req, res) => {
-    const { token, lang, frequency } = req.body;
+    const { token, lang, frequency, timezone } = req.body;
     if (!token || !lang || frequency === undefined) return res.status(400).json({ error: "Missing data" });
 
     try {
         await db.collection('fcm_tokens').doc(token).set({
             lang,
             frequency,
+            timezone: timezone || 'America/Santiago',
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
         res.json({ success: true });
@@ -230,44 +231,73 @@ app.post('/api/register-token', async (req, res) => {
     }
 });
 
-// Endpoint para lanzar notificaciones push a todos (Ej. llamándolo con CronJob a las 10:00, 14:00 y 18:00)
-// Ej: /api/cron/push-slot?slot=morning
-app.get('/api/cron/push-slot', async (req, res) => {
-    const { slot } = req.query; // 'morning', 'afternoon', 'evening'
-    if (!slot) return res.status(400).json({ error: "Missing slot" });
-
-    const today = new Date().toISOString().split('T')[0];
-
+// Endpoint para lanzar notificaciones según la hora local de cada usuario (Ej. CronJob cada 1 hora en punto)
+app.get('/api/cron/push-hourly', async (req, res) => {
     try {
         const tokensSnapshot = await db.collection('fcm_tokens').get();
         if (tokensSnapshot.empty) return res.json({ message: "No tokens registered" });
 
-        // Group tokens by language
-        const tokensByLang = { es: [], en: [], pt: [] };
+        // Group tokens by target definition: `${dateStr}_${slot}_${lang}` -> array of tokens
+        const targetGroups = {};
+        const now = new Date();
 
         tokensSnapshot.forEach(doc => {
             const data = doc.data();
-            // Si la frecuencia es 1 (solo mañana) y el slot actual NO es morning, lo saltamos para este usuario
-            if (data.frequency === 1 && slot !== 'morning') return;
+            const tz = data.timezone || 'America/Santiago';
 
-            if (tokensByLang[data.lang]) tokensByLang[data.lang].push(doc.id);
+            let localHour;
+            let localDateStr;
+            try {
+                localHour = parseInt(new Intl.DateTimeFormat('en-US', { hour: 'numeric', hourCycle: 'h23', timeZone: tz }).format(now));
+                localDateStr = new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit', timeZone: tz }).format(now);
+            } catch (e) {
+                // Ignore invalid timezones
+                return;
+            }
+
+            let slot = null;
+            if (localHour === 10) slot = 'morning';
+            else if (localHour === 14 && data.frequency === 3) slot = 'afternoon';
+            else if (localHour === 18 && data.frequency === 3) slot = 'evening';
+
+            // Si la frecuencia de bd es 1, solo se le manda el de la mañana.
+            if (data.frequency === 1 && slot !== 'morning') {
+                slot = null;
+            }
+
+            if (slot) {
+                const groupKey = `${localDateStr}_${slot}_${data.lang}`;
+                if (!targetGroups[groupKey]) {
+                    targetGroups[groupKey] = {
+                        localDateStr, slot, lang: data.lang, tokens: []
+                    };
+                }
+                targetGroups[groupKey].tokens.push(doc.id);
+            }
         });
 
         const results = {};
 
-        for (const lang of Object.keys(tokensByLang)) {
-            const tokens = tokensByLang[lang];
+        for (const key of Object.keys(targetGroups)) {
+            const group = targetGroups[key];
+            const tokens = group.tokens;
             if (tokens.length === 0) continue;
 
-            const verseRef = db.collection('daily_verses').doc(`${today}_${slot}_${lang}`);
+            const { localDateStr, slot, lang } = group;
+
+            const verseRef = db.collection('daily_verses').doc(key);
             let verseDoc = await verseRef.get();
 
-            // Si por alguna razón el versículo no estaba pre-generado, lo generamos en el momento
             if (!verseDoc.exists) {
-                console.log(`Versículo faltante para ${today} ${slot} ${lang}. Generando para Push...`);
-                const newVerse = await getVerseFromGroq(slot, lang, today);
-                await verseRef.set({ ...newVerse, createdAt: admin.firestore.FieldValue.serverTimestamp() });
-                verseDoc = await verseRef.get();
+                console.log(`Versículo faltante para ${key} (Hourly Push). Generando...`);
+                try {
+                    const newVerse = await getVerseFromGroq(slot, lang, localDateStr);
+                    await verseRef.set({ ...newVerse, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+                    verseDoc = await verseRef.get();
+                } catch (err) {
+                    console.error("Error generating verse for hourly push", err);
+                    continue;
+                }
             }
 
             const verseData = verseDoc.data();
@@ -280,7 +310,6 @@ app.get('/api/cron/push-slot', async (req, res) => {
             const title = titles[lang]?.[slot] || "Palabra Viva";
             const body = `${verseData.reference} - "${verseData.text}"`;
 
-            // Enviar en lotes (Firebase requiere arreglos de hasta 500 tokens)
             const BATC_SIZE = 500;
             let successCount = 0;
             let failureCount = 0;
@@ -293,7 +322,6 @@ app.get('/api/cron/push-slot', async (req, res) => {
                 successCount += response.successCount;
                 failureCount += response.failureCount;
 
-                // Borrar tokens inválidos
                 if (response.failureCount > 0) {
                     response.responses.forEach((resp, idx) => {
                         if (!resp.success && resp.error && (resp.error.code === 'messaging/registration-token-not-registered' || resp.error.code === 'messaging/invalid-registration-token')) {
@@ -302,12 +330,12 @@ app.get('/api/cron/push-slot', async (req, res) => {
                     });
                 }
             }
-            results[lang] = { successCount, failureCount };
+            results[key] = { successCount, failureCount };
         }
 
-        res.json({ success: true, slot, results });
+        res.json({ success: true, processed: Object.keys(targetGroups).length, results });
     } catch (e) {
-        console.error("Push Notification Error:", e);
+        console.error("Hourly Push Error:", e);
         res.status(500).json({ error: e.message });
     }
 });
