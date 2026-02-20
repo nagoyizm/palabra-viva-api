@@ -10,12 +10,30 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, 'verse_db.json');
 
-// Ensure DB file exists
-if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify({}));
+// Configuración de Firebase
+const admin = require("firebase-admin");
+
+// Debes tener la variable FIREBASE_CONFIG en Render (o un archivo serviceAccountKey.json local)
+let serviceAccount;
+try {
+    // Primero intentamos leer desde la variable de entorno de Render (JSON stringificado)
+    serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG_JSON);
+} catch (e) {
+    // Si falla, intentamos leer desde un archivo local (para desarrollo)
+    try {
+        serviceAccount = require('./serviceAccountKey.json');
+    } catch (err) {
+        console.error("No se pudo cargar la configuración de Firebase. Asegúrate de tener FIREBASE_CONFIG_JSON o serviceAccountKey.json");
+    }
 }
+
+if (serviceAccount) {
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+}
+const db = admin.firestore();
 
 const LANGUAGES = {
     es: {
@@ -115,31 +133,28 @@ app.get('/api/daily-verse', async (req, res) => {
     if (!lang || !slot) return res.status(400).json({ error: "Missing lang or slot" });
 
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-    const db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 
-    // Structure: db[date][slot][lang]
-    if (!db[today]) db[today] = {};
-    if (!db[today][slot]) db[today][slot] = {};
-
-    if (db[today][slot][lang]) {
-        return res.json(db[today][slot][lang]);
-    }
-
-    // If not in DB, generate it
     try {
-        console.log(`Generating new verse for ${today} ${slot} ${lang}...`);
-        const newVerse = await getVerseFromGroq(slot, lang, today);
+        const verseRef = db.collection('daily_verses').doc(`${today}_${slot}_${lang}`);
+        const doc = await verseRef.get();
 
-        // Save to DB
-        db[today][slot][lang] = newVerse;
-
-        // Clean up old dates to keep file small (keep last 7 days)
-        const dates = Object.keys(db).sort();
-        if (dates.length > 7) {
-            delete db[dates[0]];
+        if (doc.exists) {
+            console.log(`Retornando versículo de Firebase para ${today} ${slot} ${lang}...`);
+            return res.json(doc.data());
         }
 
-        fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+        // Si no está en Firebase, generarlo
+        console.log(`Generando NUEVO versículo para ${today} ${slot} ${lang}...`);
+        const newVerse = await getVerseFromGroq(slot, lang, today);
+
+        // Guardar en Firebase
+        await verseRef.set({
+            ...newVerse,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Opcional: Limpiar registros viejos de más de 7 días usando un script externo o Cloud Function.
+        // No lo hacemos aquí para no ralentizar la respuesta HTTP.
 
         return res.json(newVerse);
     } catch (error) {
