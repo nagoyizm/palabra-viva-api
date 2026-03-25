@@ -161,15 +161,13 @@ app.get('/api/daily-verse', async (req, res) => {
     }
 });
 
-// Endpoint para pre-generar los versículos (Llamado idealmente por un Cron Job en la madrugada)
+// Endpoint para pre-generar los versículos del DÍA SIGUIENTE
+// Llamado por un Cron Job a las 23:00 hora Argentina (02:00 UTC)
 app.get('/api/cron/generate-verses', async (req, res) => {
-    // Definimos qué día queremos generar. 
-    // Usamos el día actual del servidor (UTC)
-    const targetDate = new Date().toISOString().split('T')[0];
-
-    // Si quisieras generar siempre los de "mañana", harías: 
-    // const dateObj = new Date(); dateObj.setDate(dateObj.getDate() + 1);
-    // const targetDate = dateObj.toISOString().split('T')[0];
+    // Generamos para MAÑANA: cuando el usuario abra la app ya estará listo
+    const dateObj = new Date();
+    dateObj.setDate(dateObj.getDate() + 1); // +1 día = mañana
+    const targetDate = dateObj.toISOString().split('T')[0];
 
     const slots = ['morning', 'afternoon', 'evening'];
     const langs = ['es', 'en', 'pt'];
@@ -191,7 +189,7 @@ app.get('/api/cron/generate-verses', async (req, res) => {
                     stats.skipped++;
                     console.log(`[Cron] Ya existe: ${docId}`);
                 } else {
-                    console.log(`[Cron] Generando: ${docId}...`);
+                    console.log(`[Cron] Generando para MAÑANA: ${docId}...`);
                     try {
                         const newVerse = await getVerseFromGroq(slot, lang, targetDate);
                         await verseRef.set({
@@ -199,6 +197,8 @@ app.get('/api/cron/generate-verses', async (req, res) => {
                             createdAt: admin.firestore.FieldValue.serverTimestamp()
                         });
                         stats.generated++;
+                        // Pausa entre llamadas para no saturar la API de Groq
+                        await new Promise(r => setTimeout(r, 1000));
                     } catch (generationError) {
                         console.error(`[Cron] Error generando ${docId}:`, generationError);
                         stats.errors.push(docId);
