@@ -11,6 +11,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+// AdMob app-ads.txt verification
+app.get('/app-ads.txt', (req, res) => {
+    res.type('text/plain').send('google.com, pub-8283112589264457, DIRECT, f08c47fec0942fa0\n');
+});
+
 // Configuración de Firebase
 const admin = require("firebase-admin");
 
@@ -128,28 +133,91 @@ async function getVerseFromGroq(slotId, lang, todayString) {
 }
 
 app.get('/api/daily-verse', async (req, res) => {
-    // ... código existente sin modificar ...
-    const { lang, slot } = req.query; // lang: es/en/pt, slot: morning/afternoon/evening
+    const { lang, slot, ref } = req.query; // lang: es/en/pt, slot: morning/afternoon/evening, ref: optional forced reference
 
     if (!lang || !slot) return res.status(400).json({ error: "Missing lang or slot" });
 
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 
     try {
-        const verseRef = db.collection('daily_verses').doc(`${today}_${slot}_${lang}`);
-        const doc = await verseRef.get();
+        // 1. Buscar si ya existe la traducción específica
+        const specificVerseRef = db.collection('daily_verses').doc(`${today}_${slot}_${lang}`);
+        const specificDoc = await specificVerseRef.get();
 
-        if (doc.exists) {
-            console.log(`Retornando versículo de Firebase para ${today} ${slot} ${lang}...`);
-            return res.json(doc.data());
+        if (specificDoc.exists) {
+            return res.json(specificDoc.data());
         }
 
-        // Si no está en Firebase, generarlo
-        console.log(`Generando NUEVO versículo para ${today} ${slot} ${lang}...`);
-        const newVerse = await getVerseFromGroq(slot, lang, today);
+        // 2. Si NO existe, determinar la referencia base
+        // Si viene un ref explícito (traducción), usarlo directamente
+        let baseReference = ref ? decodeURIComponent(ref) : null;
+
+        // Si no viene ref, buscar si existe OTRA traducción para ese slot hoy
+        if (!baseReference) {
+            const otherLangs = Object.keys(LANGUAGES).filter(l => l !== lang);
+            for (const l of otherLangs) {
+                const otherDoc = await db.collection('daily_verses').doc(`${today}_${slot}_${l}`).get();
+                if (otherDoc.exists) {
+                    baseReference = otherDoc.data().reference;
+                    break;
+                }
+            }
+        }
+
+        // 3. Generar el versículo (usando la baseReference si la encontramos)
+        console.log(`Generando versículo para ${today} ${slot} ${lang}...`);
+        
+        let newVerse;
+        if (baseReference) {
+            // Ya hay una referencia elegida para hoy/slot, solo traducimos
+            const langConfig = LANGUAGES[lang];
+            const response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+                messages: [
+                    { role: "system", content: langConfig.bible_prompt },
+                    { role: "user", content: `Cita: ${baseReference}` }
+                ],
+                model: "llama-3.3-70b-versatile",
+                temperature: 0.1
+            }, {
+                headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' }
+            });
+
+            const rawContent = response.data.choices[0].message.content.trim().replace(/\*/g, '');
+            let finalText = rawContent;
+            let finalRef = baseReference;
+
+            if (rawContent.includes('|')) {
+                const parts = rawContent.split('|');
+                finalRef = parts[0].trim();
+                finalText = parts[1].trim();
+            }
+
+            // Generar imagen y reflexión para esta traducción
+            const imagePrompt = encodeURIComponent(`ethereal divine light, heavenly clouds, golden rays, religious spiritual art, ${finalText.substring(0, 30)}`);
+            const generatedImageUrl = `https://pollinations.ai/p/${imagePrompt}?width=800&height=450&seed=${Math.floor(Math.random() * 9999)}&model=flux&nologo=true`;
+
+            const expResp = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+                messages: [
+                    { role: "system", content: langConfig.pastor_prompt },
+                    { role: "user", content: `Versículo: ${finalRef} - "${finalText}"` }
+                ],
+                model: "llama-3.3-70b-versatile",
+            }, { headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' } });
+
+            newVerse = {
+                reference: finalRef,
+                text: finalText,
+                explanation: expResp.data.choices[0].message.content.trim().replace(/\*/g, ''),
+                imageUrl: generatedImageUrl,
+                lang
+            };
+        } else {
+            // Primera vez que se pide este slot hoy en cualquier idioma, generamos desde cero
+            newVerse = await getVerseFromGroq(slot, lang, today);
+        }
 
         // Guardar en Firebase
-        await verseRef.set({
+        await specificVerseRef.set({
             ...newVerse,
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
