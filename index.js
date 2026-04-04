@@ -55,11 +55,48 @@ const LANGUAGES = {
     }
 };
 
+// Obtener versículos recientes de Firestore para evitar repeticiones
+async function getRecentReferences(days = 14) {
+    try {
+        // Calcular fecha de hace N días
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - days);
+        const cutoffStr = cutoffDate.toISOString().split('T')[0];
+
+        // Buscar todos los versículos en español de los últimos N días (la referencia base)
+        const snapshot = await db.collection('daily_verses')
+            .where('lang', '==', 'es')
+            .orderBy('createdAt', 'desc')
+            .limit(days * 3) // 3 slots por día
+            .get();
+
+        const references = new Set();
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            if (data.reference) {
+                // Normalizar la referencia (quitar espacios extra, etc.)
+                references.add(data.reference.trim());
+            }
+        });
+
+        return Array.from(references);
+    } catch (e) {
+        console.warn("Could not fetch recent references:", e.message);
+        return [];
+    }
+}
+
 async function getVerseFromGroq(slotId, lang, todayString) {
     const groqKey = process.env.GROQ_API_KEY;
     if (!groqKey) throw new Error("GROQ_API_KEY missing");
 
-    // 1. Get Verse Reference
+    // 1. Obtener versículos recientes para evitar repeticiones
+    const recentRefs = await getRecentReferences(14);
+    const exclusionList = recentRefs.length > 0
+        ? `\n\nIMPORTANT: Do NOT select any of these recently used verses:\n${recentRefs.map(r => `- ${r}`).join('\n')}`
+        : '';
+
+    // 2. Get Verse Reference
     let referenceBase = "Salmos 23:1";
     try {
         const randomSalt = Math.random().toString(36).substring(7);
@@ -67,15 +104,15 @@ async function getVerseFromGroq(slotId, lang, todayString) {
             messages: [
                 {
                     role: "system",
-                    content: `You are a Bible Verse Selector. Select a UNIQUE and inspiring Bible Verse reference for ${todayString} (${slotId}). Salt: ${randomSalt}. Return ONLY the reference. NEVER pick Zefanías 3:17, Salmo 23:1, or Juan 3:16.`
+                    content: `You are a Bible Verse Selector. Select a UNIQUE and inspiring Bible Verse reference for ${todayString} (${slotId}). Return ONLY the reference in Spanish format (e.g. "Salmos 119:105"). No other text.${exclusionList}`
                 },
                 {
                     role: "user",
-                    content: `Pick a totally new verse for ${slotId} of ${todayString}. Be creative. ID: ${randomSalt}`
+                    content: `Pick a totally new verse for ${slotId} of ${todayString}. Be creative and diverse. Choose from different books. Salt: ${randomSalt}`
                 }
             ],
             model: "llama-3.3-70b-versatile",
-            temperature: 1.0
+            temperature: 1.2
         }, {
             headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' }
         });
@@ -84,7 +121,7 @@ async function getVerseFromGroq(slotId, lang, todayString) {
         console.warn("Using fallback verse ref", e.message);
     }
 
-    // 2. Get Text (translated)
+    // 3. Get Text (translated)
     const langConfig = LANGUAGES[lang];
     const response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
         messages: [
@@ -107,12 +144,12 @@ async function getVerseFromGroq(slotId, lang, todayString) {
         finalText = parts[1].trim();
     }
 
-    // 3. Generate Image
+    // 4. Generate Image
     const imagePrompt = encodeURIComponent(`ethereal divine light, heavenly clouds, golden rays, peaceful bright atmosphere, religious spiritual art, masterpiece, ${finalText.substring(0, 30)}`);
     const randomSeed = Math.floor(Math.random() * 999999);
     const generatedImageUrl = `https://pollinations.ai/p/${imagePrompt}?width=800&height=450&seed=${randomSeed}&model=flux&nologo=true`;
 
-    // 4. Get Explanation
+    // 5. Get Explanation
     const expResp = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
         messages: [
             { role: "system", content: langConfig.pastor_prompt },
@@ -248,25 +285,81 @@ app.get('/api/cron/generate-verses', async (req, res) => {
 
     try {
         for (const slot of slots) {
+            // Para cada slot, primero generamos en español (idioma base)
+            // y luego traducimos a los demás idiomas usando la misma referencia
+            let baseReference = null;
+
             for (const lang of langs) {
                 const docId = `${targetDate}_${slot}_${lang}`;
                 const verseRef = db.collection('daily_verses').doc(docId);
                 const doc = await verseRef.get();
 
                 if (doc.exists) {
+                    // Si ya existe, tomar la referencia base
+                    if (!baseReference) baseReference = doc.data().reference;
                     stats.skipped++;
                     console.log(`[Cron] Ya existe: ${docId}`);
                 } else {
                     console.log(`[Cron] Generando para MAÑANA: ${docId}...`);
                     try {
-                        const newVerse = await getVerseFromGroq(slot, lang, targetDate);
+                        let newVerse;
+                        if (baseReference) {
+                            // Ya tenemos referencia base, solo traducir
+                            const langConfig = LANGUAGES[lang];
+                            const groqKey = process.env.GROQ_API_KEY;
+                            
+                            const response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+                                messages: [
+                                    { role: "system", content: langConfig.bible_prompt },
+                                    { role: "user", content: `Cita: ${baseReference}` }
+                                ],
+                                model: "llama-3.3-70b-versatile",
+                                temperature: 0.1
+                            }, {
+                                headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' }
+                            });
+
+                            const rawContent = response.data.choices[0].message.content.trim().replace(/\*/g, '');
+                            let finalText = rawContent;
+                            let finalRef = baseReference;
+
+                            if (rawContent.includes('|')) {
+                                const parts = rawContent.split('|');
+                                finalRef = parts[0].trim();
+                                finalText = parts[1].trim();
+                            }
+
+                            const imagePrompt = encodeURIComponent(`ethereal divine light, heavenly clouds, golden rays, religious spiritual art, ${finalText.substring(0, 30)}`);
+                            const generatedImageUrl = `https://pollinations.ai/p/${imagePrompt}?width=800&height=450&seed=${Math.floor(Math.random() * 9999)}&model=flux&nologo=true`;
+
+                            const expResp = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+                                messages: [
+                                    { role: "system", content: langConfig.pastor_prompt },
+                                    { role: "user", content: `Versículo: ${finalRef} - "${finalText}"` }
+                                ],
+                                model: "llama-3.3-70b-versatile",
+                            }, { headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' } });
+
+                            newVerse = {
+                                reference: finalRef,
+                                text: finalText,
+                                explanation: expResp.data.choices[0].message.content.trim().replace(/\*/g, ''),
+                                imageUrl: generatedImageUrl,
+                                lang
+                            };
+                        } else {
+                            // Primer idioma de este slot, generar desde cero
+                            newVerse = await getVerseFromGroq(slot, lang, targetDate);
+                            baseReference = newVerse.reference;
+                        }
+
                         await verseRef.set({
                             ...newVerse,
                             createdAt: admin.firestore.FieldValue.serverTimestamp()
                         });
                         stats.generated++;
                         // Pausa entre llamadas para no saturar la API de Groq
-                        await new Promise(r => setTimeout(r, 1000));
+                        await new Promise(r => setTimeout(r, 1500));
                     } catch (generationError) {
                         console.error(`[Cron] Error generando ${docId}:`, generationError);
                         stats.errors.push(docId);
@@ -324,8 +417,8 @@ app.get('/api/cron/push-hourly', async (req, res) => {
             }
 
             let slot = null;
-            if (localHour === 10) slot = 'morning';
-            else if (localHour === 14 && data.frequency === 3) slot = 'afternoon';
+            if (localHour === 8) slot = 'morning';
+            else if (localHour === 13 && data.frequency === 3) slot = 'afternoon';
             else if (localHour === 18 && data.frequency === 3) slot = 'evening';
 
             // Si la frecuencia de bd es 1, solo se le manda el de la mañana.
