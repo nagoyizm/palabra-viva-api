@@ -308,6 +308,48 @@ app.get('/api/daily-verse', async (req, res) => {
     }
 });
 
+// Endpoint plural para traer todo el día de una vez y ahorrar peticiones (Optimización App Móvil)
+app.get('/api/daily-verses-day', async (req, res) => {
+    const { lang } = req.query;
+    if (!lang) return res.status(400).json({ error: "Missing lang" });
+
+    const today = new Date().toISOString().split('T')[0];
+    const slots = ['morning', 'afternoon', 'evening'];
+    const results = {};
+
+    try {
+        for (const slot of slots) {
+            const specificVerseRef = db.collection('daily_verses').doc(`${today}_${slot}_${lang}`);
+            const specificDoc = await specificVerseRef.get();
+
+            if (specificDoc.exists) {
+                results[slot] = specificDoc.data();
+            } else {
+                // Si no existe, lo generamos (esto puede tardar, pero el usuario lo pide una vez)
+                // Intentamos buscar referencia base
+                let baseReference = await getBaseReference(today, slot);
+                let newVerse;
+                if (baseReference) {
+                    newVerse = await translateVerse(baseReference, lang);
+                } else {
+                    newVerse = await getVerseFromGroq(slot, lang, today);
+                    newVerse.baseRef = newVerse.reference;
+                }
+
+                await specificVerseRef.set({
+                    ...newVerse,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                results[slot] = newVerse;
+            }
+        }
+        res.json(results);
+    } catch (error) {
+        console.error("Error generating daily verses:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Endpoint para forzar la corrección de traducciones de hoy
 app.get('/api/fix-translations', async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
@@ -519,12 +561,12 @@ app.get('/api/cron/push-hourly', async (req, res) => {
 
             const verseData = verseDoc.data();
             const titles = {
-                es: { morning: "Palabra Viva: Mañana 🌅", afternoon: "Palabra Viva: Tarde ☀️", evening: "Palabra Viva: Noche 🌙" },
-                en: { morning: "Living Word: Morning 🌅", afternoon: "Living Word: Afternoon ☀️", evening: "Living Word: Evening 🌙" },
-                pt: { morning: "Palavra Viva: Manhã 🌅", afternoon: "Palavra Viva: Tarde ☀️", evening: "Palavra Viva: Noite 🌙" }
+                es: { morning: "Palabra Eterna: Mañana 🌅", afternoon: "Palabra Eterna: Tarde ☀️", evening: "Palabra Eterna: Noche 🌙" },
+                en: { morning: "Eternal Word: Morning 🌅", afternoon: "Eternal Word: Afternoon ☀️", evening: "Eternal Word: Evening 🌙" },
+                pt: { morning: "Palavra Eterna: Manhã 🌅", afternoon: "Palavra Eterna: Tarde ☀️", evening: "Palavra Eterna: Noite 🌙" }
             };
 
-            const title = titles[lang]?.[slot] || "Palabra Viva";
+            const title = titles[lang]?.[slot] || "Palabra Eterna";
             const body = `${verseData.reference} - "${verseData.text}"`;
 
             const BATC_SIZE = 500;
