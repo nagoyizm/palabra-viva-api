@@ -1,0 +1,13 @@
+name: Generate Verses Cron
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # A las 02:00 UTC (equivale a las 23:00 hora de Argentina)
+  workflow_dispatch: # Permite ejecutarlo manualmente
+
+jobs:
+  ping-api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Llamar al endpoint de generación de versículos
+        run: curl -s "https://palabra-viva-api.onrender.com/api/cron/generate-verses"

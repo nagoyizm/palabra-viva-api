@@ -1,0 +1,13 @@
+name: Push Hourly Cron
+
+on:
+  schedule:
+    - cron: '0 * * * *' # Se ejecuta cada hora en punto (minuto 0)
+  workflow_dispatch: # Te permite ejecutarlo manualmente con un botón en GitHub por si quieres probarlo
+
+jobs:
+  ping-api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Llamar al endpoint de notificaciones
+        run: curl -s "https://palabra-viva-api.onrender.com/api/cron/push-hourly"
